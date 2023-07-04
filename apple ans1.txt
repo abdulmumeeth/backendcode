@@ -1,0 +1,154 @@
+package main
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"strconv"
+	"time"
+	"github.com/go-chi/chi"
+	"github.com/go-chi/chi/middleware"
+	"github.com/go-chi/render"
+	"github.com/joho/godotenv"
+	"github.com/shopspring/decimal"
+	"github.com/tidwall/gjson"
+)
+
+type App struct {
+	rates     map[string]map[string]decimal.Decimal
+	lastUpdate time.Time
+}
+
+func NewApp() *App {
+	return &App{
+		rates:     make(map[string]map[string]decimal.Decimal),
+		lastUpdate: time.Time{},
+	}
+}
+
+func (a *App) GetRatesHandler(w http.ResponseWriter, r *http.Request) {
+	
+	cryptocurrency := chi.URLParam(r, "cryptocurrency")
+	fiat := chi.URLParam(r, "fiat")
+	
+	rate, ok := a.rates[cryptocurrency][fiat]
+	if ok {
+		render.JSON(w, r, rate)
+		return
+	}
+	
+	a.updateRates()
+	
+	rate, ok = a.rates[cryptocurrency][fiat]
+	if !ok {
+		render.JSON(w, r, http.StatusNotFound)
+		return
+	}
+	
+	render.JSON(w, r, rate)
+}
+
+func (a *App) GetRatesHistoryHandler(w http.ResponseWriter, r *http.Request) {
+	
+	cryptocurrency := chi.URLParam(r, "cryptocurrency")
+	fiat := chi.URLParam(r, "fiat")
+	
+	start, err := strconv.ParseInt(chi.URLParam(r, "start"), 10, 64)
+	if err != nil {
+		render.JSON(w, r, http.StatusBadRequest)
+		return
+	}
+	end, err := strconv.ParseInt(chi.URLParam(r, "end"), 10, 64)
+	if err != nil {
+		render.JSON(w, r, http.StatusBadRequest)
+		return
+	}
+	
+	history, ok := a.ratesHistory[cryptocurrency][fiat]
+	if ok {
+		
+		history = history[start:end]
+		
+		render.JSON(w, r, history)
+		return
+	}
+	
+	a.updateRates()
+	
+	history, ok = a.ratesHistory[cryptocurrency][fiat]
+	if !ok {
+		render.JSON(w, r, http.StatusNotFound)
+		return
+	}
+	
+	history = history[start:end]
+	
+	render.JSON(w, r, history)
+}
+
+func (a *App) updateRates() {
+	
+	rates, err := getRates()
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	
+	a.rates = rates
+	a.lastUpdate = time.Now()
+}
+
+func getRates() (map[string]map[string]decimal.Decimal, error) {
+	
+	client := &http.Client{}
+	
+	req, err := http.NewRequest("GET", "https://api.coinbase.com/v2/exchange-rates", nil)
+	if err != nil {
+		return nil, err
+	}
+	
+	req.Header.Set("Authorization", "Bearer YOUR_API_KEY")
+	
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	}
+	
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	
+	var rates map[string]map[string]decimal.Decimal
+	err = json.Unmarshal(body, &rates)
+	if err != nil {
+		return nil, err
+	}
+	return rates, nil
+}
+
+func main() {
+	
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatal(err)
+	}
+	
+	app := NewApp()
+	
+	r := chi.NewRouter()
+	
+	r.Use(middleware.Logger)
+	r.Use(middleware.Recoverer)
+	
+	r.Get("/rates/{cryptocurrency}/{fiat}", app.GetRatesHandler)
+	r.Get("/rates/{cryptocurrency}/{fiat}/history", app.GetRatesHistoryHandler)
+	
+	log.Println("Listening on port 8080")
+	http.ListenAndServe(":8080", r)
